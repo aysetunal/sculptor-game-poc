@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Evaluator, Brush, SUBTRACTION } from 'three-bvh-csg';
 
 // ─── Scene ───────────────────────────────────────────────────────────────────
 const scene = new THREE.Scene();
@@ -53,51 +54,59 @@ const fillLight = new THREE.DirectionalLight(0x8888ff, 0.3);
 fillLight.position.set(-10, 5, -10);
 scene.add(fillLight);
 
-// ─── Voxel grid ──────────────────────────────────────────────────────────────
-const GRID = 16;
-const VOXEL_SIZE = 1;
-const GAP = 0.05;
-const step = VOXEL_SIZE + GAP;
-const offset = ((GRID - 1) * step) / 2;
-const halfBlock = offset + VOXEL_SIZE * 0.5;
+// ─── Solid block ─────────────────────────────────────────────────────────────
+// 16.75 = overall span of the old 16³ voxel grid (16 × 1.05 - 0.05 gap rounding)
+const BLOCK_SIZE = 16.75;
+const halfBlock = BLOCK_SIZE / 2; // 8.375
+const FADE_MS   = 300;            // freed-piece fade duration; set to 0 for instant removal
 
-const geometry = new THREE.BoxGeometry(VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
-const material = new THREE.MeshStandardMaterial({ color: 0x4fc3f7, roughness: 0.55, metalness: 0.15 });
+const blockMaterial = new THREE.MeshStandardMaterial({
+  color: 0x4fc3f7, roughness: 0.55, metalness: 0.15,
+});
 
-const count = GRID * GRID * GRID;
-const mesh = new THREE.InstancedMesh(geometry, material, count);
-mesh.castShadow = true;
-mesh.receiveShadow = true;
-
-const defaultMatrices = new Float32Array(count * 16);
-const alive = new Uint8Array(count).fill(1);
-const ZERO_MATRIX = new THREE.Matrix4().makeScale(0, 0, 0);
-
-const dummy = new THREE.Object3D();
-let bi = 0;
-for (let x = 0; x < GRID; x++) {
-  for (let y = 0; y < GRID; y++) {
-    for (let z = 0; z < GRID; z++) {
-      dummy.position.set(x * step - offset, y * step - offset, z * step - offset);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(bi, dummy.matrix);
-      dummy.matrix.toArray(defaultMatrices, bi * 16);
-      const t = y / (GRID - 1);
-      mesh.setColorAt(bi, new THREE.Color().lerpColors(new THREE.Color(0x1565c0), new THREE.Color(0x80deea), t));
-      bi++;
-    }
-  }
+// Brush = Mesh subclass from three-bvh-csg; prepareGeometry() builds the BVH
+// on first evaluate() call so no extra setup needed.
+function makeBlockBrush() {
+  const b = new Brush(new THREE.BoxGeometry(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE), blockMaterial);
+  b.castShadow = true;
+  b.receiveShadow = true;
+  b.updateMatrixWorld(true);
+  return b;
 }
-mesh.instanceMatrix.needsUpdate = true;
-mesh.instanceColor.needsUpdate = true;
-scene.add(mesh);
+
+let blockBrush = makeBlockBrush();
+scene.add(blockBrush);
+
+// ─── CSG evaluator ───────────────────────────────────────────────────────────
+const evaluator = new Evaluator();
+evaluator.useGroups = false; // single-material output
+
+// Invisible material for the cutter shape — only its geometry matters for CSG
+const cutterMaterial = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+
+// ─── Raycasting planes ───────────────────────────────────────────────────────
+// Planes sit at the outer faces of the block, normals pointing outward.
+// Ortho camera rays are parallel → intersection is exact, no edge distortion.
+const raycaster = new THREE.Raycaster();
+const planeFront = new THREE.Plane(new THREE.Vector3(0, 0, 1), -halfBlock); // z = +halfBlock
+const planeSide  = new THREE.Plane(new THREE.Vector3(1, 0, 0), -halfBlock); // x = +halfBlock
+
+function screenToFacePlane(clientX, clientY) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  raycaster.setFromCamera(new THREE.Vector2(
+    ((clientX - rect.left) / rect.width) * 2 - 1,
+    -(((clientY - rect.top) / rect.height) * 2 - 1),
+  ), camera);
+  const plane = currentView === 'front' ? planeFront : planeSide;
+  const hit = new THREE.Vector3();
+  return raycaster.ray.intersectPlane(plane, hit) ? hit : null;
+}
 
 // ─── View & cut state ────────────────────────────────────────────────────────
-let currentView = 'free';    // 'free' | 'front' | 'side'
-let atPresetView = false;    // for status display only
-let cutModeEnabled = false;  // user toggle; owns controls.enabled
+let currentView = 'free';   // 'free' | 'front' | 'side'
+let atPresetView = false;   // for status display only
+let cutModeEnabled = false;
 
-// Cutting is live when cut mode is on and we're at an axis-aligned view
 function isCuttingActive() { return cutModeEnabled && currentView !== 'free'; }
 
 const VIEWS = {
@@ -107,7 +116,6 @@ const VIEWS = {
 
 // ─── Camera tween ────────────────────────────────────────────────────────────
 const tween = { active: false, t: 0, duration: 400, from: new THREE.Vector3(), to: new THREE.Vector3() };
-
 function easeInOut(t) { return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; }
 
 // ─── Swipe trail (2D canvas overlay) ─────────────────────────────────────────
@@ -123,11 +131,9 @@ function resizeTrailCanvas() {
 resizeTrailCanvas();
 
 const TRAIL_FADE_MS = 420;
-let trailPoints = []; // { x, y, t }
+let trailPoints = [];
 
-function addTrailPoint(x, y) {
-  trailPoints.push({ x, y, t: performance.now() });
-}
+function addTrailPoint(x, y) { trailPoints.push({ x, y, t: performance.now() }); }
 
 function renderTrail() {
   trailCtx.clearRect(0, 0, trailCanvas.width, trailCanvas.height);
@@ -135,9 +141,9 @@ function renderTrail() {
   const now = performance.now();
   trailPoints = trailPoints.filter(p => now - p.t < TRAIL_FADE_MS);
   for (const p of trailPoints) {
-    const age = (now - p.t) / TRAIL_FADE_MS;       // 0 = fresh, 1 = expired
-    const alpha = Math.pow(1 - age, 1.8);           // accelerated fade
-    const r = 22 * (1 - age * 0.35);                // slight shrink as it ages
+    const age = (now - p.t) / TRAIL_FADE_MS;
+    const alpha = Math.pow(1 - age, 1.8);
+    const r = 22 * (1 - age * 0.35);
     const grad = trailCtx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
     grad.addColorStop(0,   `rgba(79,195,247,${(alpha * 0.7).toFixed(3)})`);
     grad.addColorStop(0.4, `rgba(79,195,247,${(alpha * 0.3).toFixed(3)})`);
@@ -149,15 +155,302 @@ function renderTrail() {
   }
 }
 
+// ─── Freed-piece connectivity & fading ───────────────────────────────────────
+// After each CSG cut we walk the result geometry, flood-fill triangle adjacency
+// to find disconnected components, classify by ground-touch, and fade out any
+// piece that is no longer connected to the base face (y = -halfBlock).
+
+const fadingPieces = []; // { mesh, t0 }
+
+// Returns { comp[], numComps, triCount, getIdx } for a BufferGeometry.
+// Vertices are merged by position quantised to 1e-3 so shared cut boundaries
+// are treated as connected.
+function findComponents(geo) {
+  const idx = geo.index;
+  const pos = geo.attributes.position;
+  const triCount = idx ? idx.count / 3 : pos.count / 3;
+  function getIdx(t, c) { return idx ? idx.getX(t * 3 + c) : t * 3 + c; }
+
+  const QUANT = 1e-3;
+  const keyMap = new Map();
+  const canon  = new Int32Array(pos.count);
+  for (let i = 0; i < pos.count; i++) {
+    const k = `${Math.round(pos.getX(i)/QUANT)},${Math.round(pos.getY(i)/QUANT)},${Math.round(pos.getZ(i)/QUANT)}`;
+    if (!keyMap.has(k)) keyMap.set(k, i);
+    canon[i] = keyMap.get(k);
+  }
+
+  const v2t = new Map();
+  for (let t = 0; t < triCount; t++) {
+    for (let c = 0; c < 3; c++) {
+      const v = canon[getIdx(t, c)];
+      if (!v2t.has(v)) v2t.set(v, []);
+      v2t.get(v).push(t);
+    }
+  }
+
+  const comp = new Int32Array(triCount).fill(-1);
+  let numComps = 0;
+  for (let seed = 0; seed < triCount; seed++) {
+    if (comp[seed] !== -1) continue;
+    const id = numComps++;
+    const stack = [seed];
+    comp[seed] = id;
+    while (stack.length) {
+      const t = stack.pop();
+      for (let c = 0; c < 3; c++) {
+        for (const nb of v2t.get(canon[getIdx(t, c)])) {
+          if (comp[nb] === -1) { comp[nb] = id; stack.push(nb); }
+        }
+      }
+    }
+  }
+  return { comp, numComps, triCount, getIdx };
+}
+
+// True if any vertex of component `id` has y ≤ -halfBlock + epsilon.
+function touchesBase(geo, comp, triCount, getIdx, id, eps = 0.15) {
+  const pos = geo.attributes.position;
+  for (let t = 0; t < triCount; t++) {
+    if (comp[t] !== id) continue;
+    for (let c = 0; c < 3; c++) {
+      if (pos.getY(getIdx(t, c)) <= -halfBlock + eps) return true;
+    }
+  }
+  return false;
+}
+
+// Extract triangles for all component IDs in `ids` into a new BufferGeometry.
+// Copies every attribute generically (position, normal, uv, …).
+function extractComponents(geo, comp, triCount, getIdx, ids) {
+  const tris = [];
+  for (let t = 0; t < triCount; t++) {
+    if (ids.has(comp[t])) tris.push(t);
+  }
+  const g = new THREE.BufferGeometry();
+  for (const [name, attr] of Object.entries(geo.attributes)) {
+    const sz  = attr.itemSize;
+    const arr = new Float32Array(tris.length * 3 * sz);
+    tris.forEach((t, i) => {
+      for (let c = 0; c < 3; c++) {
+        const src = getIdx(t, c) * sz;
+        const dst = (i * 3 + c) * sz;
+        for (let k = 0; k < sz; k++) arr[dst + k] = attr.array[src + k];
+      }
+    });
+    g.setAttribute(name, new THREE.BufferAttribute(arr, sz));
+  }
+  return g;
+}
+
+// Advance all fading pieces; dispose and remove once opacity hits 0.
+function updateFadingPieces(now) {
+  let i = fadingPieces.length;
+  while (i--) {
+    const fp = fadingPieces[i];
+    const elapsed = now - fp.t0;
+    if (FADE_MS === 0 || elapsed >= FADE_MS) {
+      scene.remove(fp.mesh);
+      fp.mesh.geometry.dispose();
+      fp.mesh.material.dispose();
+      fadingPieces.splice(i, 1);
+    } else {
+      fp.mesh.material.opacity = 1 - elapsed / FADE_MS;
+    }
+  }
+}
+
+// ─── Swept-path stroke shape builder ─────────────────────────────────────────
+// Builds a CCW THREE.Shape representing an offset polyline (thick stroke) in 2D.
+// pts: [{a,b}] face-plane coordinates;  R: stroke half-width
+function buildStrokeShape2D(pts, R) {
+  const ARC_SEGS = 8;
+
+  if (pts.length === 1) {
+    const sh = new THREE.Shape();
+    sh.absarc(pts[0].a, pts[0].b, R, 0, Math.PI * 2, false);
+    return sh;
+  }
+
+  // Per-segment tangent (ux,uy) and left normal (nx,ny)
+  const segs = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const dx = pts[i + 1].a - pts[i].a, dy = pts[i + 1].b - pts[i].b;
+    const len = Math.sqrt(dx * dx + dy * dy) || 1e-9;
+    segs.push({ ux: dx / len, uy: dy / len, nx: -dy / len, ny: dx / len });
+  }
+
+  // Miter offset for an interior vertex; s = +1 left, -1 right; length clamped to 2.5R
+  function miterOffset(pt, n0, n1, s) {
+    const mx = s * (n0.nx + n1.nx), my = s * (n0.ny + n1.ny);
+    const mlen = Math.sqrt(mx * mx + my * my) || 1e-9;
+    const scale = Math.min(R / mlen, R * 2.5);
+    return { a: pt.a + mx / mlen * scale, b: pt.b + my / mlen * scale };
+  }
+
+  // Right (s=-1) and left (s=+1) offset polylines
+  const right = [], left = [];
+  for (let i = 0; i < pts.length; i++) {
+    const pt = pts[i];
+    if (i === 0) {
+      right.push({ a: pt.a - segs[0].nx * R, b: pt.b - segs[0].ny * R });
+      left.push({  a: pt.a + segs[0].nx * R, b: pt.b + segs[0].ny * R });
+    } else if (i === pts.length - 1) {
+      const s = segs[segs.length - 1];
+      right.push({ a: pt.a - s.nx * R, b: pt.b - s.ny * R });
+      left.push({  a: pt.a + s.nx * R, b: pt.b + s.ny * R });
+    } else {
+      right.push(miterOffset(pt, segs[i - 1], segs[i], -1));
+      left.push( miterOffset(pt, segs[i - 1], segs[i], +1));
+    }
+  }
+
+  // Arc helper: ARC_SEGS+1 points along an arc of radius R
+  function arcPts(cx, cy, a0, a1, ccw) {
+    let diff = a1 - a0;
+    if (ccw) { while (diff < 0) diff += Math.PI * 2; }
+    else      { while (diff > 0) diff -= Math.PI * 2; }
+    const res = [];
+    for (let i = 0; i <= ARC_SEGS; i++) {
+      const a = a0 + diff * (i / ARC_SEGS);
+      res.push({ a: cx + Math.cos(a) * R, b: cy + Math.sin(a) * R });
+    }
+    return res;
+  }
+
+  // Assemble CCW outline: right forward → end cap → left backward → start cap
+  const verts = [];
+  right.forEach(p => verts.push(p));
+  {
+    const s = segs[segs.length - 1];
+    const fw = Math.atan2(s.uy, s.ux);
+    // End cap: sweep CCW from right side (fw-π/2) through forward to left side (fw+π/2)
+    arcPts(pts[pts.length - 1].a, pts[pts.length - 1].b, fw - Math.PI / 2, fw + Math.PI / 2, true)
+      .forEach(p => verts.push(p));
+  }
+  for (let i = left.length - 1; i >= 0; i--) verts.push(left[i]);
+  {
+    const s = segs[0];
+    const fw = Math.atan2(s.uy, s.ux);
+    // Start cap: sweep CCW from left side (fw+π/2) through backward to right side (fw-π/2)
+    arcPts(pts[0].a, pts[0].b, fw + Math.PI / 2, fw - Math.PI / 2, true)
+      .forEach(p => verts.push(p));
+  }
+
+  const shape = new THREE.Shape();
+  shape.moveTo(verts[0].a, verts[0].b);
+  for (let i = 1; i < verts.length; i++) shape.lineTo(verts[i].a, verts[i].b);
+  shape.closePath();
+  return shape;
+}
+
+// ─── CSG cut (applied on pointerup — one BVH rebuild per stroke) ─────────────
+const CUT_RADIUS = 1.1;
+let swipeHits = [];
+
+function applyCSGCut() {
+  if (!swipeHits.length) return;
+
+  // Map world-space hits to face-plane 2D coords and deduplicate
+  const raw = currentView === 'front'
+    ? swipeHits.map(p => ({ a: p.x, b: p.y }))
+    : swipeHits.map(p => ({ a: p.z, b: p.y }));
+
+  const pts = [raw[0]];
+  for (let i = 1; i < raw.length; i++) {
+    const prev = pts[pts.length - 1];
+    const dx = raw[i].a - prev.a, dy = raw[i].b - prev.b;
+    if (Math.sqrt(dx * dx + dy * dy) > 0.05) pts.push(raw[i]);
+  }
+
+  const shape = buildStrokeShape2D(pts, CUT_RADIUS);
+  const depth = BLOCK_SIZE + 2; // slightly larger than block to guarantee full punch-through
+  let geo = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false });
+
+  if (currentView === 'front') {
+    // Shape in XY; ExtrudeGeometry extrudes along +localZ; center it along world Z
+    geo.translate(0, 0, -depth / 2);
+  } else {
+    // Shape in ZY (a=worldZ, b=worldY); need extrusion along world X.
+    // R_y(-π/2) maps localX→worldZ, localY→worldY, localZ→world-X.
+    // After rotation the extrusion spans worldX from 0 to -depth; shift by +depth/2 to center.
+    geo.applyMatrix4(new THREE.Matrix4().makeRotationY(-Math.PI / 2));
+    geo.translate(depth / 2, 0, 0);
+  }
+
+  const cutterBrush = new Brush(geo, cutterMaterial);
+  cutterBrush.updateMatrixWorld(true);
+  blockBrush.updateMatrixWorld(true);
+
+  try {
+    const result = evaluator.evaluate(blockBrush, cutterBrush, SUBTRACTION);
+    scene.remove(blockBrush);
+    blockBrush.geometry.dispose();
+
+    const { comp, numComps, triCount, getIdx } = findComponents(result.geometry);
+
+    if (numComps <= 1) {
+      // No separation — use the result as-is
+      result.material = blockMaterial;
+      result.castShadow = true;
+      result.receiveShadow = true;
+      blockBrush = result;
+      scene.add(blockBrush);
+    } else {
+      const grounded = new Set(), freed = new Set();
+      for (let c = 0; c < numComps; c++) {
+        (touchesBase(result.geometry, comp, triCount, getIdx, c) ? grounded : freed).add(c);
+      }
+
+      if (grounded.size === 0) {
+        // Degenerate: nothing touches the base; keep everything to avoid empty block
+        result.material = blockMaterial;
+        result.castShadow = true;
+        result.receiveShadow = true;
+        blockBrush = result;
+        scene.add(blockBrush);
+      } else {
+        // Extract freed piece geometries before disposing result
+        for (const c of freed) {
+          const g   = extractComponents(result.geometry, comp, triCount, getIdx, new Set([c]));
+          const mat = blockMaterial.clone();
+          mat.transparent = true;
+          mat.opacity = 1;
+          const mesh = new THREE.Mesh(g, mat);
+          scene.add(mesh);
+          fadingPieces.push({ mesh, t0: performance.now() });
+        }
+
+        // Build new blockBrush from all grounded components
+        const groundedGeo = extractComponents(result.geometry, comp, triCount, getIdx, grounded);
+        result.geometry.dispose();
+
+        blockBrush = new Brush(groundedGeo, blockMaterial);
+        blockBrush.castShadow = true;
+        blockBrush.receiveShadow = true;
+        scene.add(blockBrush);
+      }
+    }
+  } catch (err) {
+    console.warn('CSG subtraction failed:', err);
+  }
+
+  geo.dispose();
+  swipeHits = [];
+}
+
 // ─── Actions ─────────────────────────────────────────────────────────────────
 function resetBlock() {
-  const mat = new THREE.Matrix4();
-  for (let i = 0; i < count; i++) {
-    mat.fromArray(defaultMatrices, i * 16);
-    mesh.setMatrixAt(i, mat);
-    alive[i] = 1;
+  for (const fp of fadingPieces) {
+    scene.remove(fp.mesh);
+    fp.mesh.geometry.dispose();
+    fp.mesh.material.dispose();
   }
-  mesh.instanceMatrix.needsUpdate = true;
+  fadingPieces.length = 0;
+  scene.remove(blockBrush);
+  blockBrush.geometry.dispose();
+  blockBrush = makeBlockBrush();
+  scene.add(blockBrush);
 }
 
 function setView(view) {
@@ -173,112 +466,40 @@ function setView(view) {
 
 function toggleCutMode() {
   cutModeEnabled = !cutModeEnabled;
-  // Cut mode owns the orbit lock: ON → freeze camera, OFF → restore orbit
-  controls.enabled = !cutModeEnabled;
-  if (!cutModeEnabled) trailPoints = []; // clear any lingering trail on exit
+  controls.enabled = !cutModeEnabled; // lock camera while carving
+  if (!cutModeEnabled) trailPoints = [];
   updateCutButton();
   updateStatus();
 }
 
-// ─── Voxel helpers ───────────────────────────────────────────────────────────
-function voxelIdx(x, y, z) { return x * GRID * GRID + y * GRID + z; }
-
-function killColumn(ga, gy) {
-  if (currentView === 'front') {
-    for (let z = 0; z < GRID; z++) {
-      const i = voxelIdx(ga, gy, z);
-      if (alive[i]) { alive[i] = 0; mesh.setMatrixAt(i, ZERO_MATRIX); }
-    }
-  } else {
-    for (let x = 0; x < GRID; x++) {
-      const i = voxelIdx(x, gy, ga);
-      if (alive[i]) { alive[i] = 0; mesh.setMatrixAt(i, ZERO_MATRIX); }
-    }
-  }
-  mesh.instanceMatrix.needsUpdate = true;
-}
-
-// ─── Raycasting ──────────────────────────────────────────────────────────────
-const raycaster = new THREE.Raycaster();
-const hitPoint = new THREE.Vector3();
-const planeFront = new THREE.Plane(new THREE.Vector3(0, 0, 1), -halfBlock);
-const planeSide  = new THREE.Plane(new THREE.Vector3(1, 0, 0), -halfBlock);
-
-function screenToGridCell(clientX, clientY) {
-  const rect = renderer.domElement.getBoundingClientRect();
-  raycaster.setFromCamera(new THREE.Vector2(
-    ((clientX - rect.left) / rect.width) * 2 - 1,
-    -(((clientY - rect.top) / rect.height) * 2 - 1),
-  ), camera);
-
-  const plane = currentView === 'front' ? planeFront : planeSide;
-  if (!raycaster.ray.intersectPlane(plane, hitPoint)) return null;
-
-  const gy = Math.floor((hitPoint.y + halfBlock) / step);
-  if (gy < 0 || gy >= GRID) return null;
-
-  if (currentView === 'front') {
-    const gx = Math.floor((hitPoint.x + halfBlock) / step);
-    if (gx < 0 || gx >= GRID) return null;
-    return { ga: gx, gy };
-  } else {
-    const gz = Math.floor((hitPoint.z + halfBlock) / step);
-    if (gz < 0 || gz >= GRID) return null;
-    return { ga: gz, gy };
-  }
-}
-
-// ─── Bresenham ───────────────────────────────────────────────────────────────
-function* bresenham(x0, y0, x1, y1) {
-  const dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-  const dy = Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-  let err = dx - dy;
-  while (true) {
-    yield { ga: x0, gy: y0 };
-    if (x0 === x1 && y0 === y1) break;
-    const e2 = 2 * err;
-    if (e2 > -dy) { err -= dy; x0 += sx; }
-    if (e2 <  dx) { err += dx; y0 += sy; }
-  }
-}
-
-// ─── Swipe / cut ─────────────────────────────────────────────────────────────
+// ─── Pointer events ──────────────────────────────────────────────────────────
 let cutting = false;
-let lastCell = null;
 
+// Capture phase: consume the event before OrbitControls can orbit
 renderer.domElement.addEventListener('pointerdown', (e) => {
   if (!cutModeEnabled) return;
-  // In cut mode the camera is locked, so always consume the event — never let
-  // a missed swipe fall through to orbit controls or re-enable orbit.
   e.stopPropagation();
-  if (currentView === 'free') return; // no axis defined, swallow silently
-  addTrailPoint(e.clientX, e.clientY);
-  const cell = screenToGridCell(e.clientX, e.clientY);
-  if (!cell) return; // miss: trail still shows, but no column removed
+  if (currentView === 'free') return;
   cutting = true;
-  lastCell = cell;
-  killColumn(cell.ga, cell.gy);
+  swipeHits = [];
+  addTrailPoint(e.clientX, e.clientY);
+  const hit = screenToFacePlane(e.clientX, e.clientY);
+  if (hit) swipeHits.push(hit);
 }, { capture: true });
 
 window.addEventListener('pointermove', (e) => {
   if (!cutting) return;
   addTrailPoint(e.clientX, e.clientY);
-  const cell = screenToGridCell(e.clientX, e.clientY);
-  if (!cell) return;
-  for (const c of bresenham(lastCell.ga, lastCell.gy, cell.ga, cell.gy)) {
-    killColumn(c.ga, c.gy);
-  }
-  lastCell = cell;
+  const hit = screenToFacePlane(e.clientX, e.clientY);
+  if (hit) swipeHits.push(hit);
 });
 
 window.addEventListener('pointerup', () => {
   if (!cutting) return;
   cutting = false;
-  lastCell = null;
-  // controls.enabled is owned by cutModeEnabled — do NOT touch it here
+  applyCSGCut(); // one CSG op per stroke
 });
 
-// Track when user manually orbits (only fires when controls.enabled = true)
 controls.addEventListener('start', () => {
   atPresetView = false;
   updateStatus();
@@ -320,7 +541,6 @@ function makeButton(label, onClick) {
 ui.appendChild(makeButton('Reset', resetBlock));
 ui.appendChild(makeButton('Front', () => setView('front')));
 ui.appendChild(makeButton('Side',  () => setView('side')));
-
 const cutBtn = makeButton('Cut: OFF', toggleCutMode);
 ui.appendChild(cutBtn);
 document.body.appendChild(ui);
@@ -357,8 +577,6 @@ function animate() {
     tween.t = Math.min(tween.t + delta / tween.duration, 1);
     camera.position.lerpVectors(tween.from, tween.to, easeInOut(tween.t));
     camera.lookAt(0, 0, 0);
-    // controls.update() is a no-op when controls.enabled = false, but call it
-    // anyway so damping state stays in sync for when controls re-enable later
     controls.update();
     if (tween.t >= 1) {
       tween.active = false;
@@ -370,6 +588,7 @@ function animate() {
   }
 
   renderTrail();
+  updateFadingPieces(now);
   renderer.render(scene, camera);
 }
 animate();
