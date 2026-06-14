@@ -9,7 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "three": "^0.176.0"
+    "three": "^0.184.0",
+    "three-bvh-csg": "^0.0.18"
   },
   "devDependencies": {
     "vite": "^6.3.5"
