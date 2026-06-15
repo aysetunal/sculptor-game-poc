@@ -55,17 +55,14 @@ fillLight.position.set(-10, 5, -10);
 scene.add(fillLight);
 
 // ─── Solid block ─────────────────────────────────────────────────────────────
-// 16.75 = overall span of the old 16³ voxel grid (16 × 1.05 - 0.05 gap rounding)
 const BLOCK_SIZE = 16.75;
-const halfBlock = BLOCK_SIZE / 2; // 8.375
-const FADE_MS   = 300;            // freed-piece fade duration; set to 0 for instant removal
+const halfBlock  = BLOCK_SIZE / 2; // 8.375
+const FADE_MS    = 300;            // freed-piece fade duration; set to 0 for instant removal
 
 const blockMaterial = new THREE.MeshStandardMaterial({
   color: 0x4fc3f7, roughness: 0.55, metalness: 0.15,
 });
 
-// Brush = Mesh subclass from three-bvh-csg; prepareGeometry() builds the BVH
-// on first evaluate() call so no extra setup needed.
 function makeBlockBrush() {
   const b = new Brush(new THREE.BoxGeometry(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE), blockMaterial);
   b.castShadow = true;
@@ -118,48 +115,50 @@ const VIEWS = {
 const tween = { active: false, t: 0, duration: 400, from: new THREE.Vector3(), to: new THREE.Vector3() };
 function easeInOut(t) { return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; }
 
-// ─── Swipe trail (2D canvas overlay) ─────────────────────────────────────────
+// ─── Straight-line laser trail (2D canvas overlay) ───────────────────────────
 const trailCanvas = document.createElement('canvas');
 trailCanvas.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:5;';
 document.body.appendChild(trailCanvas);
 const trailCtx = trailCanvas.getContext('2d');
 
 function resizeTrailCanvas() {
-  trailCanvas.width = window.innerWidth;
+  trailCanvas.width  = window.innerWidth;
   trailCanvas.height = window.innerHeight;
 }
 resizeTrailCanvas();
 
-const TRAIL_FADE_MS = 420;
-let trailPoints = [];
-
-function addTrailPoint(x, y) { trailPoints.push({ x, y, t: performance.now() }); }
+let lineStartScreen   = null; // { x, y } screen coords, set on pointerdown
+let lineCurrentScreen = null; // { x, y } screen coords, updated on pointermove
 
 function renderTrail() {
   trailCtx.clearRect(0, 0, trailCanvas.width, trailCanvas.height);
-  if (!trailPoints.length) return;
-  const now = performance.now();
-  trailPoints = trailPoints.filter(p => now - p.t < TRAIL_FADE_MS);
-  for (const p of trailPoints) {
-    const age = (now - p.t) / TRAIL_FADE_MS;
-    const alpha = Math.pow(1 - age, 1.8);
-    const r = 22 * (1 - age * 0.35);
-    const grad = trailCtx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
-    grad.addColorStop(0,   `rgba(79,195,247,${(alpha * 0.7).toFixed(3)})`);
-    grad.addColorStop(0.4, `rgba(79,195,247,${(alpha * 0.3).toFixed(3)})`);
-    grad.addColorStop(1,   'rgba(79,195,247,0)');
+  if (!lineStartScreen || !lineCurrentScreen) return;
+
+  const { x: x0, y: y0 } = lineStartScreen;
+  const { x: x1, y: y1 } = lineCurrentScreen;
+
+  trailCtx.save();
+  trailCtx.shadowColor = 'rgba(79,195,247,0.7)';
+  trailCtx.shadowBlur  = 10;
+  trailCtx.strokeStyle = 'rgba(79,195,247,0.9)';
+  trailCtx.lineWidth   = 2;
+  trailCtx.lineCap     = 'round';
+  trailCtx.beginPath();
+  trailCtx.moveTo(x0, y0);
+  trailCtx.lineTo(x1, y1);
+  trailCtx.stroke();
+  // endpoint dots
+  for (const [x, y] of [[x0, y0], [x1, y1]]) {
     trailCtx.beginPath();
-    trailCtx.arc(p.x, p.y, r, 0, Math.PI * 2);
-    trailCtx.fillStyle = grad;
+    trailCtx.arc(x, y, 3, 0, Math.PI * 2);
+    trailCtx.fillStyle = 'rgba(79,195,247,1)';
+    trailCtx.shadowBlur = 6;
     trailCtx.fill();
   }
+  trailCtx.restore();
 }
 
 // ─── Freed-piece connectivity & fading ───────────────────────────────────────
-// After each CSG cut we walk the result geometry, flood-fill triangle adjacency
-// to find disconnected components, classify by ground-touch, and fade out any
-// piece that is no longer connected to the base face (y = -halfBlock).
-
 const fadingPieces = []; // { mesh, t0 }
 
 // Returns { comp[], numComps, triCount, getIdx } for a BufferGeometry.
@@ -208,18 +207,6 @@ function findComponents(geo) {
   return { comp, numComps, triCount, getIdx };
 }
 
-// True if any vertex of component `id` has y ≤ -halfBlock + epsilon.
-function touchesBase(geo, comp, triCount, getIdx, id, eps = 0.15) {
-  const pos = geo.attributes.position;
-  for (let t = 0; t < triCount; t++) {
-    if (comp[t] !== id) continue;
-    for (let c = 0; c < 3; c++) {
-      if (pos.getY(getIdx(t, c)) <= -halfBlock + eps) return true;
-    }
-  }
-  return false;
-}
-
 // Extract triangles for all component IDs in `ids` into a new BufferGeometry.
 // Copies every attribute generically (position, normal, uv, …).
 function extractComponents(geo, comp, triCount, getIdx, ids) {
@@ -243,6 +230,25 @@ function extractComponents(geo, comp, triCount, getIdx, ids) {
   return g;
 }
 
+// Signed mesh volume via the divergence theorem (tetrahedron formula).
+// Works directly on the result geometry without extracting triangles first.
+function componentVolume(geo, comp, triCount, getIdx, id) {
+  const pos = geo.attributes.position;
+  let vol = 0;
+  for (let t = 0; t < triCount; t++) {
+    if (comp[t] !== id) continue;
+    const ai = getIdx(t, 0), bi = getIdx(t, 1), ci = getIdx(t, 2);
+    const ax = pos.getX(ai), ay = pos.getY(ai), az = pos.getZ(ai);
+    const bx = pos.getX(bi), by = pos.getY(bi), bz = pos.getZ(bi);
+    const cx = pos.getX(ci), cy = pos.getY(ci), cz = pos.getZ(ci);
+    // scalar triple product: a · (b × c)
+    vol += ax * (by * cz - bz * cy)
+         + ay * (bz * cx - bx * cz)
+         + az * (bx * cy - by * cx);
+  }
+  return Math.abs(vol / 6);
+}
+
 // Advance all fading pieces; dispose and remove once opacity hits 0.
 function updateFadingPieces(now) {
   let i = fadingPieces.length;
@@ -260,120 +266,46 @@ function updateFadingPieces(now) {
   }
 }
 
-// ─── Swept-path stroke shape builder ─────────────────────────────────────────
-// Builds a CCW THREE.Shape representing an offset polyline (thick stroke) in 2D.
-// pts: [{a,b}] face-plane coordinates;  R: stroke half-width
-function buildStrokeShape2D(pts, R) {
-  const ARC_SEGS = 8;
-
-  if (pts.length === 1) {
-    const sh = new THREE.Shape();
-    sh.absarc(pts[0].a, pts[0].b, R, 0, Math.PI * 2, false);
-    return sh;
-  }
-
-  // Per-segment tangent (ux,uy) and left normal (nx,ny)
-  const segs = [];
-  for (let i = 0; i < pts.length - 1; i++) {
-    const dx = pts[i + 1].a - pts[i].a, dy = pts[i + 1].b - pts[i].b;
-    const len = Math.sqrt(dx * dx + dy * dy) || 1e-9;
-    segs.push({ ux: dx / len, uy: dy / len, nx: -dy / len, ny: dx / len });
-  }
-
-  // Miter offset for an interior vertex; s = +1 left, -1 right; length clamped to 2.5R
-  function miterOffset(pt, n0, n1, s) {
-    const mx = s * (n0.nx + n1.nx), my = s * (n0.ny + n1.ny);
-    const mlen = Math.sqrt(mx * mx + my * my) || 1e-9;
-    const scale = Math.min(R / mlen, R * 2.5);
-    return { a: pt.a + mx / mlen * scale, b: pt.b + my / mlen * scale };
-  }
-
-  // Right (s=-1) and left (s=+1) offset polylines
-  const right = [], left = [];
-  for (let i = 0; i < pts.length; i++) {
-    const pt = pts[i];
-    if (i === 0) {
-      right.push({ a: pt.a - segs[0].nx * R, b: pt.b - segs[0].ny * R });
-      left.push({  a: pt.a + segs[0].nx * R, b: pt.b + segs[0].ny * R });
-    } else if (i === pts.length - 1) {
-      const s = segs[segs.length - 1];
-      right.push({ a: pt.a - s.nx * R, b: pt.b - s.ny * R });
-      left.push({  a: pt.a + s.nx * R, b: pt.b + s.ny * R });
-    } else {
-      right.push(miterOffset(pt, segs[i - 1], segs[i], -1));
-      left.push( miterOffset(pt, segs[i - 1], segs[i], +1));
-    }
-  }
-
-  // Arc helper: ARC_SEGS+1 points along an arc of radius R
-  function arcPts(cx, cy, a0, a1, ccw) {
-    let diff = a1 - a0;
-    if (ccw) { while (diff < 0) diff += Math.PI * 2; }
-    else      { while (diff > 0) diff -= Math.PI * 2; }
-    const res = [];
-    for (let i = 0; i <= ARC_SEGS; i++) {
-      const a = a0 + diff * (i / ARC_SEGS);
-      res.push({ a: cx + Math.cos(a) * R, b: cy + Math.sin(a) * R });
-    }
-    return res;
-  }
-
-  // Assemble CCW outline: right forward → end cap → left backward → start cap
-  const verts = [];
-  right.forEach(p => verts.push(p));
-  {
-    const s = segs[segs.length - 1];
-    const fw = Math.atan2(s.uy, s.ux);
-    // End cap: sweep CCW from right side (fw-π/2) through forward to left side (fw+π/2)
-    arcPts(pts[pts.length - 1].a, pts[pts.length - 1].b, fw - Math.PI / 2, fw + Math.PI / 2, true)
-      .forEach(p => verts.push(p));
-  }
-  for (let i = left.length - 1; i >= 0; i--) verts.push(left[i]);
-  {
-    const s = segs[0];
-    const fw = Math.atan2(s.uy, s.ux);
-    // Start cap: sweep CCW from left side (fw+π/2) through backward to right side (fw-π/2)
-    arcPts(pts[0].a, pts[0].b, fw + Math.PI / 2, fw - Math.PI / 2, true)
-      .forEach(p => verts.push(p));
-  }
-
-  const shape = new THREE.Shape();
-  shape.moveTo(verts[0].a, verts[0].b);
-  for (let i = 1; i < verts.length; i++) shape.lineTo(verts[i].a, verts[i].b);
-  shape.closePath();
-  return shape;
-}
-
 // ─── CSG cut (applied on pointerup — one BVH rebuild per stroke) ─────────────
-const CUT_RADIUS = 1.1;
-let swipeHits = [];
+const CUT_KERF  = 0.15; // blade thickness in world units
+let cutStartHit = null; // face-plane world hit recorded on pointerdown
 
-function applyCSGCut() {
-  if (!swipeHits.length) return;
+function applyCSGCut(endHit) {
+  if (!cutStartHit || !endHit) return;
 
-  // Map world-space hits to face-plane 2D coords and deduplicate
-  const raw = currentView === 'front'
-    ? swipeHits.map(p => ({ a: p.x, b: p.y }))
-    : swipeHits.map(p => ({ a: p.z, b: p.y }));
+  // Map world hits to face-plane 2D coords (a = horizontal axis, b = vertical)
+  const p0 = currentView === 'front'
+    ? { a: cutStartHit.x, b: cutStartHit.y }
+    : { a: cutStartHit.z, b: cutStartHit.y };
+  const p1 = currentView === 'front'
+    ? { a: endHit.x, b: endHit.y }
+    : { a: endHit.z, b: endHit.y };
 
-  const pts = [raw[0]];
-  for (let i = 1; i < raw.length; i++) {
-    const prev = pts[pts.length - 1];
-    const dx = raw[i].a - prev.a, dy = raw[i].b - prev.b;
-    if (Math.sqrt(dx * dx + dy * dy) > 0.05) pts.push(raw[i]);
-  }
+  const da = p1.a - p0.a, db = p1.b - p0.b;
+  const segLen = Math.sqrt(da * da + db * db);
+  if (segLen < 0.01) return; // tap with no drag → no-op
 
-  const shape = buildStrokeShape2D(pts, CUT_RADIUS);
+  // Perpendicular unit normal for the kerf half-width
+  const nx = -db / segLen, ny = da / segLen;
+  const h  = CUT_KERF / 2;
+
+  // Thin rectangle blade along the cut segment
+  const shape = new THREE.Shape();
+  shape.moveTo(p0.a - nx * h, p0.b - ny * h);
+  shape.lineTo(p1.a - nx * h, p1.b - ny * h);
+  shape.lineTo(p1.a + nx * h, p1.b + ny * h);
+  shape.lineTo(p0.a + nx * h, p0.b + ny * h);
+  shape.closePath();
+
   const depth = BLOCK_SIZE + 2; // slightly larger than block to guarantee full punch-through
-  let geo = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false });
+  const geo   = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false });
 
   if (currentView === 'front') {
-    // Shape in XY; ExtrudeGeometry extrudes along +localZ; center it along world Z
+    // Shape in XY; extrude along +localZ; centre along world Z
     geo.translate(0, 0, -depth / 2);
   } else {
-    // Shape in ZY (a=worldZ, b=worldY); need extrusion along world X.
-    // R_y(-π/2) maps localX→worldZ, localY→worldY, localZ→world-X.
-    // After rotation the extrusion spans worldX from 0 to -depth; shift by +depth/2 to center.
+    // Shape in ZY (a=worldZ, b=worldY); extrusion must go along world X.
+    // R_y(-π/2): localX→worldZ, localY→worldY, localZ→world-X.
     geo.applyMatrix4(new THREE.Matrix4().makeRotationY(-Math.PI / 2));
     geo.translate(depth / 2, 0, 0);
   }
@@ -384,66 +316,57 @@ function applyCSGCut() {
 
   try {
     const result = evaluator.evaluate(blockBrush, cutterBrush, SUBTRACTION);
-    scene.remove(blockBrush);
-    blockBrush.geometry.dispose();
-
     const { comp, numComps, triCount, getIdx } = findComponents(result.geometry);
 
     if (numComps <= 1) {
-      // No separation — use the result as-is
-      result.material = blockMaterial;
-      result.castShadow = true;
-      result.receiveShadow = true;
-      blockBrush = result;
-      scene.add(blockBrush);
+      // Non-severing cut — discard result, block is visually unchanged
+      result.geometry.dispose();
     } else {
-      const grounded = new Set(), freed = new Set();
+      // Find the largest-volume component — that piece stays as the new block
+      let largestId = 0, largestVol = 0;
       for (let c = 0; c < numComps; c++) {
-        (touchesBase(result.geometry, comp, triCount, getIdx, c) ? grounded : freed).add(c);
+        const v = componentVolume(result.geometry, comp, triCount, getIdx, c);
+        if (v > largestVol) { largestVol = v; largestId = c; }
       }
 
-      if (grounded.size === 0) {
-        // Degenerate: nothing touches the base; keep everything to avoid empty block
-        result.material = blockMaterial;
-        result.castShadow = true;
-        result.receiveShadow = true;
-        blockBrush = result;
-        scene.add(blockBrush);
-      } else {
-        // Extract freed piece geometries before disposing result
-        for (const c of freed) {
-          const g   = extractComponents(result.geometry, comp, triCount, getIdx, new Set([c]));
-          const mat = blockMaterial.clone();
-          mat.transparent = true;
-          mat.opacity = 1;
-          const mesh = new THREE.Mesh(g, mat);
-          scene.add(mesh);
-          fadingPieces.push({ mesh, t0: performance.now() });
-        }
-
-        // Build new blockBrush from all grounded components
-        const groundedGeo = extractComponents(result.geometry, comp, triCount, getIdx, grounded);
-        result.geometry.dispose();
-
-        blockBrush = new Brush(groundedGeo, blockMaterial);
-        blockBrush.castShadow = true;
-        blockBrush.receiveShadow = true;
-        scene.add(blockBrush);
+      // All other components fade out
+      for (let c = 0; c < numComps; c++) {
+        if (c === largestId) continue;
+        const g   = extractComponents(result.geometry, comp, triCount, getIdx, new Set([c]));
+        const mat = blockMaterial.clone();
+        mat.transparent = true;
+        mat.opacity = 1;
+        const mesh = new THREE.Mesh(g, mat);
+        scene.add(mesh);
+        fadingPieces.push({ mesh, t0: performance.now() });
       }
+
+      // Commit: swap old block for the largest component
+      scene.remove(blockBrush);
+      blockBrush.geometry.dispose();
+
+      const largestGeo = extractComponents(result.geometry, comp, triCount, getIdx, new Set([largestId]));
+      result.geometry.dispose();
+
+      blockBrush = new Brush(largestGeo, blockMaterial);
+      blockBrush.castShadow    = true;
+      blockBrush.receiveShadow = true;
+      scene.add(blockBrush);
     }
   } catch (err) {
     console.warn('CSG subtraction failed:', err);
   }
 
   geo.dispose();
-  swipeHits = [];
+  cutStartHit = null;
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
 function resetBlock() {
-  cutting = false;
-  swipeHits = [];
-  trailPoints = [];
+  cutting           = false;
+  cutStartHit       = null;
+  lineStartScreen   = null;
+  lineCurrentScreen = null;
   for (const fp of fadingPieces) {
     scene.remove(fp.mesh);
     fp.mesh.geometry.dispose();
@@ -470,7 +393,11 @@ function setView(view) {
 function toggleCutMode() {
   cutModeEnabled = !cutModeEnabled;
   controls.enabled = !cutModeEnabled; // lock camera while carving
-  if (!cutModeEnabled) trailPoints = [];
+  if (!cutModeEnabled) {
+    cutStartHit       = null;
+    lineStartScreen   = null;
+    lineCurrentScreen = null;
+  }
   updateCutButton();
   updateStatus();
 }
@@ -483,24 +410,26 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
   if (!cutModeEnabled) return;
   e.stopPropagation();
   if (currentView === 'free') return;
-  cutting = true;
-  swipeHits = [];
-  addTrailPoint(e.clientX, e.clientY);
+  cutting           = true;
+  cutStartHit       = null;
+  lineStartScreen   = { x: e.clientX, y: e.clientY };
+  lineCurrentScreen = { x: e.clientX, y: e.clientY };
   const hit = screenToFacePlane(e.clientX, e.clientY);
-  if (hit) swipeHits.push(hit);
+  if (hit) cutStartHit = hit.clone();
 }, { capture: true });
 
 window.addEventListener('pointermove', (e) => {
   if (!cutting) return;
-  addTrailPoint(e.clientX, e.clientY);
-  const hit = screenToFacePlane(e.clientX, e.clientY);
-  if (hit) swipeHits.push(hit);
+  lineCurrentScreen = { x: e.clientX, y: e.clientY };
 });
 
-window.addEventListener('pointerup', () => {
+window.addEventListener('pointerup', (e) => {
   if (!cutting) return;
   cutting = false;
-  applyCSGCut(); // one CSG op per stroke
+  const endHit = screenToFacePlane(e.clientX, e.clientY);
+  applyCSGCut(endHit);
+  lineStartScreen   = null;
+  lineCurrentScreen = null;
 });
 
 controls.addEventListener('start', () => {
