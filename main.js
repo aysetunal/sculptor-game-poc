@@ -441,6 +441,9 @@ function applyCSGCut() {
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
 function resetBlock() {
+  cutting = false;
+  swipeHits = [];
+  trailPoints = [];
   for (const fp of fadingPieces) {
     scene.remove(fp.mesh);
     fp.mesh.geometry.dispose();
